@@ -34,9 +34,12 @@ fn role_decisions_gate_privileged_treasury_actions() {
     let newbie = soroban_sdk::Address::generate(&env);
     
     let signers = addrs(&env, 2);
-    let asset = soroban_sdk::Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(owner.clone()).address();
     let treasury = deploy_treasury(&env, &owner, &asset, 1, &svec(&env, &signers), &acl_id);
-    let gov = deploy_governance(&env, &owner, &svec(&env, &members), 34, 50, &acl_id);
+    let gov = deploy_governance(&env, &owner, &svec(&env, &members), 34, 50, &acl_id, &treasury.address);
+    
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &asset);
+    token_admin.mint(&signers[0], &10_000);
     treasury.deposit(&signers[0], &10_000);
 
     assert_eq!(
@@ -63,7 +66,8 @@ fn governance_membership_lifecycle_updates_authorization() {
     for m in &members {
         _acl.assign_role(&admin, m, &Role::Member);
     }
-    let gov = deploy_governance(&env, &admin, &svec(&env, &members), 34, 50, &acl_id);
+    let treasury_addr = soroban_sdk::Address::generate(&env);
+    let gov = deploy_governance(&env, &admin, &svec(&env, &members), 34, 50, &acl_id, &treasury_addr);
 
     let newbie = soroban_sdk::Address::generate(&env);
     assert_eq!(
@@ -144,6 +148,8 @@ fn terminal_operations_cannot_replay_across_contracts() {
     let asset = env.register_stellar_asset_contract_v2(admin.clone()).address();
     let recipient = soroban_sdk::Address::generate(&env);
     let treasury = deploy_treasury(&env, &admin, &asset, 2, &svec(&env, &signers), &acl_id);
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &asset);
+    token_admin.mint(&signers[0], &10_000);
     treasury.deposit(&signers[0], &10_000);
     soroban_sdk::token::StellarAssetClient::new(&env, &asset).mint(&treasury.address, &10_000);
     let exp = env.ledger().timestamp() + 10_000;
@@ -159,7 +165,7 @@ fn terminal_operations_cannot_replay_across_contracts() {
     for m in &gmembers {
         _acl.assign_role(&admin, m, &Role::Member);
     }
-    let gov = deploy_governance(&env, &admin, &svec(&env, &gmembers), 34, 50, &acl_id);
+    let gov = deploy_governance(&env, &admin, &svec(&env, &gmembers), 34, 50, &acl_id, &treasury.address);
     let pid = gov.create_proposal(
         &gmembers[0],
         &symbol_short!("t"),
@@ -193,4 +199,213 @@ fn terminal_operations_cannot_replay_across_contracts() {
         vault.try_emergency_unlock(&esigners[0], &lock),
         Err(Ok(vault::Error::AlreadyClaimed))
     );
+}
+
+/// INV-X4: A passed Funding proposal in governance drives a cross-contract
+/// call to the treasury, creating a withdrawal transaction. The proposal is
+/// only marked executed after the treasury accepts the request. Governance
+/// must be registered as a treasury signer for the call to succeed.
+#[test]
+fn funding_proposal_execution_queues_treasury_withdrawal() {
+    let env = new_env();
+    let admin = soroban_sdk::Address::generate(&env);
+    let (acl_id, _acl) = deploy_acl(&env, &admin);
+
+    let gov_member = soroban_sdk::Address::generate(&env);
+    _acl.assign_role(&admin, &gov_member, &Role::Member);
+
+    let treasury_signers = addrs(&env, 2);
+    for s in &treasury_signers {
+        _acl.assign_role(&admin, s, &Role::Member);
+    }
+
+    let asset = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let treasury = deploy_treasury(
+        &env, &admin, &asset, 2,
+        &svec(&env, &treasury_signers),
+        &acl_id,
+    );
+
+    // Add governance as a treasury signer so it can propose withdrawals
+    let gov_members = addrs(&env, 1);
+    for m in &gov_members {
+        _acl.assign_role(&admin, m, &Role::Member);
+    }
+    let gov = deploy_governance(
+        &env, &admin, &svec(&env, &gov_members), 34, 50,
+        &acl_id, &treasury.address,
+    );
+    treasury.add_signer(&admin, &gov.address);
+
+    // Fund the treasury
+    let sac_client = soroban_sdk::token::StellarAssetClient::new(&env, &asset);
+    sac_client.mint(&treasury.address, &100_000);
+    treasury.deposit(&treasury_signers[0], &100_000);
+
+    // Create and pass a Funding proposal
+    let recipient = soroban_sdk::Address::generate(&env);
+    let pid = gov.create_proposal(
+        &gov_members[0],
+        &symbol_short!("fund_ops"),
+        &symbol_short!("ops"),
+        &ProposalAction::Funding,
+        &40_000,
+        &recipient,
+    );
+    gov.vote(&gov_members[0], &pid, &true);
+    advance_seq(&env, 100);
+    assert_eq!(gov.finalize(&gov_members[0], &pid), ProposalStatus::Passed);
+
+    // Execute — should create a treasury withdrawal transaction
+    gov.execute_proposal(&admin, &pid);
+    let proposal = gov.get_proposal(&pid);
+    assert_eq!(proposal.status, ProposalStatus::Executed);
+
+    // Verify treasury transaction was created
+    let tx = treasury.get_transaction(&1);
+    assert_eq!(tx.amount, 40_000);
+    assert_eq!(tx.to, recipient);
+    assert_eq!(tx.proposer, gov.address);
+    assert_eq!(tx.approvals.len(), 1);
+    assert_eq!(tx.approvals.get(0).unwrap(), gov.address);
+    assert_eq!(tx.executed, false);
+    assert_eq!(tx.canceled, false);
+
+    assert_treasury_invariants(&treasury, 100_000, 0);
+    assert_acl_consistent(&_acl);
+}
+
+/// INV-X4 deny path: governance not registered as a treasury signer
+/// cannot propose withdrawals — the Funding proposal stays un-executed
+/// and the treasury is never touched.
+#[test]
+fn funding_proposal_fails_when_governance_not_a_signer() {
+    let env = new_env();
+    let admin = soroban_sdk::Address::generate(&env);
+    let (acl_id, _acl) = deploy_acl(&env, &admin);
+
+    let gov_member = soroban_sdk::Address::generate(&env);
+    _acl.assign_role(&admin, &gov_member, &Role::Member);
+
+    let treasury_signers = addrs(&env, 2);
+    for s in &treasury_signers {
+        _acl.assign_role(&admin, s, &Role::Member);
+    }
+
+    let asset = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let treasury = deploy_treasury(
+        &env, &admin, &asset, 2,
+        &svec(&env, &treasury_signers),
+        &acl_id,
+    );
+
+    // NOTE: governance is NOT added as a treasury signer
+    let gov_members = addrs(&env, 1);
+    for m in &gov_members {
+        _acl.assign_role(&admin, m, &Role::Member);
+    }
+    let gov = deploy_governance(
+        &env, &admin, &svec(&env, &gov_members), 34, 50,
+        &acl_id, &treasury.address,
+    );
+
+    let sac_client = soroban_sdk::token::StellarAssetClient::new(&env, &asset);
+    sac_client.mint(&treasury.address, &100_000);
+    treasury.deposit(&treasury_signers[0], &100_000);
+
+    let recipient = soroban_sdk::Address::generate(&env);
+    let pid = gov.create_proposal(
+        &gov_members[0],
+        &symbol_short!("fund_ops"),
+        &symbol_short!("ops"),
+        &ProposalAction::Funding,
+        &40_000,
+        &recipient,
+    );
+    gov.vote(&gov_members[0], &pid, &true);
+    advance_seq(&env, 100);
+    assert_eq!(gov.finalize(&gov_members[0], &pid), ProposalStatus::Passed);
+
+    // Execute should fail — governance is not a treasury signer
+    assert_eq!(
+        gov.try_execute_proposal(&admin, &pid),
+        Err(Ok(governance::Error::ProposalRejected))
+    );
+
+    // Proposal must NOT be marked executed
+    let proposal = gov.get_proposal(&pid);
+    assert_eq!(proposal.status, ProposalStatus::Passed);
+
+    // No treasury transaction should exist
+    assert_eq!(
+        treasury.try_get_transaction(&1),
+        Err(Ok(treasury::Error::TransactionNotFound))
+    );
+
+    assert_acl_consistent(&_acl);
+}
+
+/// INV-X4 failure-atomicity: insufficient funds in the treasury must
+/// not mark the governance proposal executed.
+#[test]
+fn funding_proposal_insufficient_treasury_balance_does_not_execute() {
+    let env = new_env();
+    let admin = soroban_sdk::Address::generate(&env);
+    let (acl_id, _acl) = deploy_acl(&env, &admin);
+
+    let gov_member = soroban_sdk::Address::generate(&env);
+    _acl.assign_role(&admin, &gov_member, &Role::Member);
+
+    let treasury_signers = addrs(&env, 2);
+    for s in &treasury_signers {
+        _acl.assign_role(&admin, s, &Role::Member);
+    }
+
+    let asset = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let treasury = deploy_treasury(
+        &env, &admin, &asset, 2,
+        &svec(&env, &treasury_signers),
+        &acl_id,
+    );
+
+    let gov_members = addrs(&env, 1);
+    for m in &gov_members {
+        _acl.assign_role(&admin, m, &Role::Member);
+    }
+    let gov = deploy_governance(
+        &env, &admin, &svec(&env, &gov_members), 34, 50,
+        &acl_id, &treasury.address,
+    );
+    treasury.add_signer(&admin, &gov.address);
+
+    // Treasury has only 1_000, but proposal asks for 40_000
+    let sac_client = soroban_sdk::token::StellarAssetClient::new(&env, &asset);
+    sac_client.mint(&treasury.address, &1_000);
+    treasury.deposit(&treasury_signers[0], &1_000);
+
+    let recipient = soroban_sdk::Address::generate(&env);
+    let pid = gov.create_proposal(
+        &gov_members[0],
+        &symbol_short!("fund_big"),
+        &symbol_short!("big"),
+        &ProposalAction::Funding,
+        &40_000,
+        &recipient,
+    );
+    gov.vote(&gov_members[0], &pid, &true);
+    advance_seq(&env, 100);
+    assert_eq!(gov.finalize(&gov_members[0], &pid), ProposalStatus::Passed);
+
+    // Execute should fail — insufficient treasury balance
+    assert_eq!(
+        gov.try_execute_proposal(&admin, &pid),
+        Err(Ok(governance::Error::ProposalRejected))
+    );
+
+    // Proposal MUST NOT be marked executed — failure atomicity
+    let proposal = gov.get_proposal(&pid);
+    assert_eq!(proposal.status, ProposalStatus::Passed);
+
+    assert_treasury_invariants(&treasury, 1_000, 0);
+    assert_acl_consistent(&_acl);
 }

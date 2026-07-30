@@ -20,8 +20,11 @@ fn setup() -> (
     let asset = env.register_stellar_asset_contract_v2(admin.clone()).address();
     let recipient = soroban_sdk::Address::generate(&env);
     let c = deploy_treasury(&env, &admin, &asset, 2, &svec(&env, &signers), &acl_id);
-    // Mint enough tokens to the treasury for execute() to transfer
-    soroban_sdk::token::StellarAssetClient::new(&env, &asset).mint(&c.address, &10_000_000);
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &asset);
+    for s in &signers {
+        token_admin.mint(s, &10_000_000);
+    }
+    token_admin.mint(&admin, &10_000_000);
     (env, admin, signers, recipient, c)
 }
 
@@ -40,8 +43,9 @@ fn seeded_operation_sequences() {
         for _ in 0..40 {
             match rng.below(5) {
                 0 => {
-                    let amt = (rng.below(10) + 1) as i128 * 1_000;
-                    if c.try_deposit(&signers[0], &amt).is_ok() {
+                    let s = &signers[rng.below(signers.len() as u64) as usize];
+                    let amt = (rng.below(9) + 1) as i128 * 1_000;
+                    if c.try_deposit(s, &amt).is_ok() {
                         deposited += amt;
                     }
                 }

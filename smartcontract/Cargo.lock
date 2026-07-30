@@ -1326,6 +1326,7 @@ version = "0.1.0"
 dependencies = [
  "soroban-sdk",
  "stellar-sentinel-access-control",
+ "stellar-sentinel-treasury",
 ]
 
 [[package]]

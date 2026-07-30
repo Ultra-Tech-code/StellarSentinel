@@ -10,10 +10,12 @@ doctest = false
 [dependencies]
 soroban-sdk = { workspace = true }
 stellar-sentinel-access-control = { path = "../access-control" }
+stellar-sentinel-treasury = { path = "../treasury" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 stellar-sentinel-access-control = { path = "../access-control", features = ["testutils"] }
+stellar-sentinel-treasury = { path = "../treasury", features = ["testutils"] }
 
 [features]
-testutils = ["soroban-sdk/testutils", "stellar-sentinel-access-control/testutils"]
+testutils = ["soroban-sdk/testutils", "stellar-sentinel-access-control/testutils", "stellar-sentinel-treasury/testutils"]

@@ -19,9 +19,10 @@ fn treasury_storage_growth_is_linear() {
     let admin = soroban_sdk::Address::generate(&env);
     let (acl_id, _acl) = deploy_acl(&env, &admin);
     let signers = addrs(&env, 2);
-    let asset = soroban_sdk::Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(admin.clone()).address();
     let recipient = soroban_sdk::Address::generate(&env);
-    let c = deploy_treasury(&env, &admin, &asset, 1, &svec(&env, &signers), &acl_id);
+    let c = deploy_treasury(&env, &admin, &asset, 2, &svec(&env, &signers), &acl_id);
+    soroban_sdk::token::StellarAssetClient::new(&env, &asset).mint(&signers[0], &(N as i128 * 10_000));
     c.deposit(&signers[0], &(N as i128 * 10_000));
 
     let exp = env.ledger().timestamp() + 1_000_000;
@@ -69,7 +70,8 @@ fn governance_storage_growth_is_linear() {
     for m in &members {
         acl.assign_role(&admin, m, &Role::Member);
     }
-    let c = deploy_governance(&env, &admin, &svec(&env, &members), 50, 1_000_000, &acl_id);
+    let treasury_addr = soroban_sdk::Address::generate(&env);
+    let c = deploy_governance(&env, &admin, &svec(&env, &members), 50, 1_000_000, &acl_id, &treasury_addr);
 
     for _ in 0..N {
         c.create_proposal(

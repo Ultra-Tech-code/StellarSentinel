@@ -68,7 +68,8 @@ fn treasury_lifecycle_emits_every_step() {
     let asset = env.register_stellar_asset_contract_v2(admin.clone()).address();
     let recipient = soroban_sdk::Address::generate(&env);
     let c = deploy_treasury(&env, &admin, &asset, 2, &svec(&env, &signers), &acl_id);
-    soroban_sdk::token::StellarAssetClient::new(&env, &asset).mint(&c.address, &1_000_000);
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &asset);
+    token_admin.mint(&signers[0], &1_000_000);
 
     let count_before = env.events().all().len(); // setup events already emitted
     assert!(count_before >= 1, "init event present");

@@ -126,10 +126,11 @@ pub fn deploy_governance(
     quorum_percent: u32,
     voting_period: u32,
     acl_id: &Address,
+    treasury_id: &Address,
 ) -> GovernanceContractClient<'static> {
     let id = env.register_contract(None, GovernanceContract);
     let c = GovernanceContractClient::new(env, &id);
-    c.initialize(admin, members, &quorum_percent, &voting_period, acl_id);
+    c.initialize(admin, members, &quorum_percent, &voting_period, acl_id, treasury_id);
     c
 }
 

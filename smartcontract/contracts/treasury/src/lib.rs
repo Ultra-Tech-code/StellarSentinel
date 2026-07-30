@@ -246,7 +246,21 @@ impl TreasuryContract {
 
         from.require_auth();
 
-        // Update balance
+        // Pull the bound asset address
+        let asset: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Asset)
+            .ok_or(Error::NotInitialized)?;
+            
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &asset);
+        
+        // Transfer tokens from the depositor to the treasury contract.
+        // Requires the depositor to have authorized this transfer.
+        token_client.transfer(&from, &contract_address, &amount);
+
+        // Update balance tracking
         let current_balance: i128 = env
             .storage()
             .instance()
@@ -984,7 +998,7 @@ mod test {
 
     fn setup_contract_with_token(
         init_balance: i128,
-    ) -> (Env, Address, Address, TreasuryContractClient<'static>, soroban_sdk::Address) {
+    ) -> (Env, Address, Address, TreasuryContractClient<'static>, soroban_sdk::Address, token::StellarAssetClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
@@ -994,8 +1008,10 @@ mod test {
         let contract_id = env.register_contract(None, crate::TreasuryContract);
         let client = TreasuryContractClient::new(&env, &contract_id);
         let sac_client = token::StellarAssetClient::new(&env, &asset);
-        sac_client.mint(&contract_id, &init_balance);
-        (env, admin, acl_id, client, asset)
+        if init_balance > 0 {
+            sac_client.mint(&contract_id, &init_balance);
+        }
+        (env, admin, acl_id, client, asset, sac_client)
     }
 
     #[test]
@@ -1025,14 +1041,14 @@ mod test {
 
     #[test]
     fn test_deposit() {
-        let (env, admin, acl_id, client) = setup_contract();
+        let (env, admin, acl_id, client, asset, sac_client) = setup_contract_with_token(0);
 
         let signer1 = Address::generate(&env);
-        let asset = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
         client.initialize(&admin, &asset, &1, &signers, &acl_id);
 
         let depositor = Address::generate(&env);
+        sac_client.mint(&depositor, &1_000_000);
         client.deposit(&depositor, &1_000_000);
 
         assert_eq!(client.get_balance(), 1_000_000);
@@ -1040,7 +1056,7 @@ mod test {
 
     #[test]
     fn test_propose_and_approve() {
-        let (env, admin, acl_id, client, asset) = setup_contract_with_token(5_000_000);
+        let (env, admin, acl_id, client, asset, sac_client) = setup_contract_with_token(5_000_000);
 
         let signer1 = Address::generate(&env);
         let signer2 = Address::generate(&env);
@@ -1048,6 +1064,7 @@ mod test {
         client.initialize(&admin, &asset, &2, &signers, &acl_id);
 
         // Deposit some funds
+        sac_client.mint(&signer1, &5_000_000);
         client.deposit(&signer1, &5_000_000);
 
         // Propose withdrawal
@@ -1133,7 +1150,7 @@ mod test {
 
     #[test]
     fn test_invariant_balance_tracking() {
-        let (env, admin, acl_id, client, asset) = setup_contract_with_token(1_500);
+        let (env, admin, acl_id, client, asset, sac_client) = setup_contract_with_token(1_500);
         let signer1 = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
         client.initialize(&admin, &asset, &1, &signers, &acl_id);
@@ -1141,9 +1158,11 @@ mod test {
         assert_eq!(client.get_balance(), 0);
 
         let depositor = Address::generate(&env);
+        sac_client.mint(&depositor, &1_000);
         client.deposit(&depositor, &1_000);
         assert_eq!(client.get_balance(), 1_000);
 
+        sac_client.mint(&depositor, &500);
         client.deposit(&depositor, &500);
         assert_eq!(client.get_balance(), 1_500);
 
@@ -1169,7 +1188,7 @@ mod test {
 
     #[test]
     fn test_event_emission_coverage() {
-        let (env, admin, acl_id, client, asset) = setup_contract_with_token(500);
+        let (env, admin, acl_id, client, asset, sac_client) = setup_contract_with_token(500);
         let signer1 = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
         
@@ -1179,6 +1198,7 @@ mod test {
         assert!(events_after_init > events_before_init);
 
         let depositor = Address::generate(&env);
+        sac_client.mint(&depositor, &500);
         client.deposit(&depositor, &500);
         let events_after_deposit = env.events().all().len();
         assert!(events_after_deposit > events_after_init);
@@ -1229,6 +1249,7 @@ mod test {
         let sac_client = token::StellarAssetClient::new(&env, &asset);
         sac_client.mint(&contract_id, &5_000_000);
 
+        sac_client.mint(&signer1, &5_000_000);
         client.deposit(&signer1, &5_000_000);
 
         let tx_id = client.propose_withdrawal(
@@ -1278,6 +1299,7 @@ mod test {
         let sac_client = token::StellarAssetClient::new(&env, &asset);
         sac_client.mint(&contract_id, &5_000_000);
 
+        sac_client.mint(&signer1, &5_000_000);
         client.deposit(&signer1, &5_000_000);
 
         let tx_id = client.propose_withdrawal(
@@ -1322,6 +1344,7 @@ mod test {
         let sac_client = token::StellarAssetClient::new(&env, &asset);
         sac_client.mint(&contract_id, &5_000_000);
 
+        sac_client.mint(&signer1, &5_000_000);
         client.deposit(&signer1, &5_000_000);
 
         let expiry = env.ledger().timestamp() + 500;
@@ -1371,6 +1394,7 @@ mod test {
         let sac_client = token::StellarAssetClient::new(&env, &asset);
         sac_client.mint(&contract_id, &5_000_000);
 
+        sac_client.mint(&signer1, &5_000_000);
         client.deposit(&signer1, &5_000_000);
 
         let tx_id = client.propose_withdrawal(
@@ -1417,8 +1441,9 @@ mod test {
         client.initialize(&admin, &asset, &2, &signers, &acl_id);
 
         let sac_client = token::StellarAssetClient::new(&env, &asset);
-        sac_client.mint(&contract_id, &1_000_000);
 
+
+        sac_client.mint(&signer1, &1_000_000);
         client.deposit(&signer1, &1_000_000);
 
         let tx_id = client.propose_withdrawal(

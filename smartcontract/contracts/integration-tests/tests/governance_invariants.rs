@@ -23,7 +23,8 @@ fn setup(
     for m in &members {
         acl.assign_role(&admin, m, &Role::Member);
     }
-    let c = deploy_governance(&env, &admin, &svec(&env, &members), quorum, period, &acl_id);
+    let treasury_addr = soroban_sdk::Address::generate(&env);
+    let c = deploy_governance(&env, &admin, &svec(&env, &members), quorum, period, &acl_id, &treasury_addr);
     (env, admin, members, c)
 }
 

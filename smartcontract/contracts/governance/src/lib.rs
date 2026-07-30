@@ -10,6 +10,7 @@ use soroban_sdk::{
 };
 
 use stellar_sentinel_access_control::AccessControlContractClient;
+use stellar_sentinel_treasury::TreasuryContractClient;
 
 // ============================================================================
 // Error Codes
@@ -72,6 +73,8 @@ pub enum DataKey {
     Vote(u64, Address),
     /// The access-control contract address for RBAC enforcement.
     AclAddress,
+    /// The treasury contract address for cross-contract fund execution.
+    TreasuryAddress,
 }
 
 /// The type of action a proposal requests.
@@ -170,6 +173,7 @@ impl GovernanceContract {
     /// * `quorum_percent` - Minimum vote percentage for quorum (1-100).
     /// * `voting_period` - Duration of voting in ledger sequences.
     /// * `acl_address` - The access-control contract address for RBAC enforcement.
+    /// * `treasury_address` - The treasury contract address for cross-contract fund execution.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -177,6 +181,7 @@ impl GovernanceContract {
         quorum_percent: u32,
         voting_period: u32,
         acl_address: Address,
+        treasury_address: Address,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(Error::AlreadyInitialized);
@@ -202,6 +207,7 @@ impl GovernanceContract {
             .instance()
             .set(&DataKey::ProposalCounter, &0_u64);
         env.storage().instance().set(&DataKey::AclAddress, &acl_address);
+        env.storage().instance().set(&DataKey::TreasuryAddress, &treasury_address);
 
         env.events().publish(
             (symbol_short!("gov"), symbol_short!("init")),
@@ -430,6 +436,25 @@ impl GovernanceContract {
 
     /// Execute a passed proposal.
     /// Only the admin or proposer can execute.
+    ///
+    /// # Cross-contract execution (Funding proposals)
+    ///
+    /// For `ProposalAction::Funding`, the governance contract calls the
+    /// treasury's `propose_withdrawal()` to queue a withdrawal for the
+    /// approved amount and recipient. This follows the *propose-into-treasury*
+    /// trust model: governance does not directly execute the withdrawal;
+    /// instead it creates a treasury transaction that still requires
+    /// signer approvals according to the treasury's m-of-n policy.
+    ///
+    /// The governance contract must be registered as a signer in the treasury
+    /// (via `TreasuryContract::add_signer`) for the cross-contract call to
+    /// succeed. If the treasury call fails (e.g. insufficient funds, governance
+    /// not a signer, policy invalidated), the proposal is NOT marked executed
+    /// and the error is propagated to the caller.
+    ///
+    /// This preserves treasury sovereignty — the governance DAO can approve
+    /// spending but cannot unilaterally move funds without going through the
+    /// treasury's own multi-sig approval process.
     pub fn execute_proposal(
         env: Env,
         executor: Address,
@@ -473,8 +498,36 @@ impl GovernanceContract {
             ProposalAction::RemoveMember => {
                 Self::internal_remove_member(&env, &proposal.target)?;
             }
-            _ => {
-                // Funding and General proposals are handled externally
+            ProposalAction::Funding => {
+                let treasury_address: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::TreasuryAddress)
+                    .ok_or(Error::NotInitialized)?;
+
+                let treasury_client =
+                    TreasuryContractClient::new(&env, &treasury_address);
+
+                let expires_at = env
+                    .ledger()
+                    .timestamp()
+                    .checked_add(7 * 24 * 3600)
+                    .unwrap_or(u64::MAX);
+
+                let memo = symbol_short!("gov_fund");
+
+                let _ = treasury_client
+                    .try_propose_withdrawal(
+                        &env.current_contract_address(),
+                        &proposal.target,
+                        &proposal.amount,
+                        &memo,
+                        &expires_at,
+                    )
+                    .map_err(|_| Error::ProposalRejected)?;
+            }
+            ProposalAction::PolicyChange | ProposalAction::General => {
+                // PolicyChange and General proposals are handled externally
             }
         }
 
@@ -740,7 +793,7 @@ impl GovernanceContract {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::testutils::Address as _;
     use soroban_sdk::Env;
     use stellar_sentinel_access_control::{
         AccessControlContract, AccessControlContractClient, Role,
@@ -758,25 +811,26 @@ mod test {
         acl_client.assign_role(admin, target, role);
     }
 
-    fn setup_contract() -> (Env, Address, Address, GovernanceContractClient<'static>) {
+    fn setup_contract() -> (Env, Address, Address, Address, GovernanceContractClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, GovernanceContract);
         let client = GovernanceContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let acl_id = deploy_acl(&env, &admin);
-        (env, admin, acl_id, client)
+        let treasury_id = Address::generate(&env);
+        (env, admin, acl_id, treasury_id, client)
     }
 
     #[test]
     fn test_initialize() {
-        let (env, admin, acl_id, client) = setup_contract();
+        let (env, admin, acl_id, treasury_id, client) = setup_contract();
 
         let member1 = Address::generate(&env);
         let member2 = Address::generate(&env);
         let members = Vec::from_array(&env, [member1.clone(), member2.clone()]);
 
-        client.initialize(&admin, &members, &50, &1000, &acl_id);
+        client.initialize(&admin, &members, &50, &1000, &acl_id, &treasury_id);
 
         let config = client.get_config();
         assert_eq!(config.admin, admin);
@@ -787,7 +841,7 @@ mod test {
 
     #[test]
     fn test_create_proposal_and_vote() {
-        let (env, admin, acl_id, client) = setup_contract();
+        let (env, admin, acl_id, treasury_id, client) = setup_contract();
 
         let member1 = Address::generate(&env);
         let member2 = Address::generate(&env);
@@ -801,7 +855,7 @@ mod test {
         assign_role(&env, &acl_id, &admin, &member2, &Role::Member);
         assign_role(&env, &acl_id, &admin, &member3, &Role::Member);
 
-        client.initialize(&admin, &members, &50, &1000, &acl_id);
+        client.initialize(&admin, &members, &50, &1000, &acl_id, &treasury_id);
 
         // Create a funding proposal
         let proposal_id = client.create_proposal(
@@ -826,14 +880,14 @@ mod test {
 
     #[test]
     fn test_has_voted() {
-        let (env, admin, acl_id, client) = setup_contract();
+        let (env, admin, acl_id, treasury_id, client) = setup_contract();
 
         let member1 = Address::generate(&env);
         let members = Vec::from_array(&env, [member1.clone()]);
 
         assign_role(&env, &acl_id, &admin, &member1, &Role::Member);
 
-        client.initialize(&admin, &members, &50, &1000, &acl_id);
+        client.initialize(&admin, &members, &50, &1000, &acl_id, &treasury_id);
 
         let proposal_id = client.create_proposal(
             &member1,
